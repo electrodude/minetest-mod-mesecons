@@ -137,18 +137,26 @@ function mesecon.invertRule(r)
 end
 
 function mesecon.tablecopy(table) -- deep table copy
-	if type(table) ~= "table" then return table end -- no need to copy
-	local newtable = {}
+	local seen = {}
 
-	for idx, item in pairs(table) do
-		if type(item) == "table" then
-			newtable[idx] = mesecon.tablecopy(item)
-		else
-			newtable[idx] = item
+	local function tcopy(table)
+		if type(table) ~= "table" then return table end -- no need to copy
+		local newtable = {}
+
+		if seen[table] ~= nil then
+			return seen[table]
 		end
+
+		seen[table] = newtable
+
+		for idx, item in pairs(table) do
+			newtable[tcopy(idx)] = tcopy(item)
+		end
+
+		return newtable
 	end
 
-	return newtable
+	return tcopy(table)
 end
 
 function mesecon.cmpAny(t1, t2)

@@ -37,6 +37,12 @@ local rules = {
 	d = {x =  0, y = 0, z = -1, name="D"},
 }
 
+-- luacontroller cache
+local lc_cache = {}
+
+-- timeout sentinel
+-- thrown on timeout, pcall and coroutine.resume propogate it
+local timeout_sentinel = {}
 
 ------------------
 -- Action stuff --
@@ -167,7 +173,9 @@ local function burn_controller(pos)
 	local node = minetest.get_node(pos)
 	node.name = BASENAME.."_burnt"
 	minetest.swap_node(pos, node)
-	minetest.get_meta(pos):set_string("lc_memory", "");
+	local meta = minetest.get_meta(pos)
+	meta:set_string("lc_memory", "");
+	lc_cache[meta:get_int("luac_id")] = nil
 	-- Wait for pending operations
 	minetest.after(0.2, mesecon.receptor_off, pos, mesecon.rules.flat)
 end
@@ -227,9 +235,85 @@ local function safe_string_find(...)
 	return string.find(...)
 end
 
+
+local function get_loadstring(env)
+	return function(code, chunkname, fenv)
+		if code:byte(1) == 27 then
+			error("Binary code prohibited.")
+		end
+
+		local f, err = loadstring(code, chunkname)
+
+		if not f then return nil, err end
+
+		-- is this right/enough?
+		setfenv(f, fenv or env)
+
+		if rawget(_G, "jit") then
+			jit.off(f, true)
+		end
+
+		return f
+	end
+end
+
+-- This is shared among all luacontrollers.  I don't think its a problem.
+-- It's only necessary so that coroutine.running will only return coroutines
+--  belonging to luacontrollers
+local safe_coroutines = setmetatable({}, {__mode = 'kv'})
+
+local function make_safe_coroutine()
+	local safe_coroutine = {}
+
+	function safe_coroutine.create(f)
+		local co = coroutine.create(f)
+
+		safe_coroutines[co] = co
+
+		return co
+	end
+
+	function safe_coroutine.resume(co, ...)
+		-- probably needs some more checks, debug.sethook(), etc.
+		local ret = {coroutine.resume(co, ...)}
+
+		if (not ret[1]) and ret[2] == timeout_sentinel then
+			error(timeout_sentinel)	-- keep throwing timeout sentinel
+		end
+
+		return unpack(ret)
+	end
+
+	function safe_coroutine.running()
+		local co = coroutine.running()
+
+		return safe_coroutines[co]
+	end
+
+	function safe_coroutine.status(co)
+		return coroutine.status(co)
+	end
+
+	function safe_coroutine.wrap(f)
+		local co = safe_coroutine.create(f)
+
+		return function(...)
+			return safe_coroutine.resume(co, ...)
+		end
+	end
+
+	function safe_coroutine.yield(...)
+		return coroutine.yield(...)
+	end
+
+	return safe_coroutine
+end
+
 local function remove_functions(x)
+	if true then return x end
+
 	local tp = type(x)
-	if tp == "function" then
+	if tp == "function" or tp == "coroutine" then
 		return nil
 	end
 
@@ -281,30 +365,57 @@ local function get_digiline_send(pos)
 	end
 end
 
+mesecon.luacontroller_extfuncs = {}
+
+mesecon.luacontroller_extfuncs.remoteboot =
+[====[
+return function(mychan, bootchan, bootpath)
+	local event = _G.event
+	_G.event = nil
+
+	if state == "run" then
+		coroutine.resume(co, event)
+
+		if coroutine.status(co) ~= "suspended" then
+			state = "dead"
+			co = nil
+		end
+	elseif not state then
+		digiline_send(bootchan, {type = "get", path = bootpath, sender = mychan})
+		state = "bootwait"
+	elseif state == "bootwait" then
+		if event.type == "digiline" and event.channel == mychan then
+			local msg = event.msg
+
+			if msg.sender == bootchan and msg.type == "get" and msg.path == bootpath then
+				local s = msg.data
+
+				co = coroutine.create(loadstring(s))
+				coroutine.resume(co, mychan, bootchan)
+
+				if coroutine.status(co) == "suspended" then
+					state = "run"
+				else
+					state = "off"
+					co = nil
+				end
+			end
+		end
+	end
+end
+]====]
+
 
 local safe_globals = {
 	"assert", "error", "ipairs", "next", "pairs", "select",
 	"tonumber", "tostring", "type", "unpack", "_VERSION"
 }
-local function create_environment(pos, mem, event)
-	-- Gather variables for the environment
-	local vports = minetest.registered_nodes[minetest.get_node(pos).name].virtual_portstates
-	local vports_copy = {}
-	for k, v in pairs(vports) do vports_copy[k] = v end
-	local rports = get_real_port_states(pos)
-
-	-- Create new library tables on each call to prevent one LuaController
-	-- from breaking a library and messing up other LuaControllers.
+local function create_environment(luac_id, pos, mem)
+	-- Create new luacontroller environment
+	-- Each luacontroller gets its own environment, they are stored in lc_cache[luac_id].env
 	local env = {
-		pin = merge_port_states(vports, rports),
-		port = vports_copy,
-		event = event,
 		mem = mem,
-		heat = minetest.get_meta(pos):get_int("heat"),
-		heat_max = mesecon.setting("overheat_max", 20),
 		print = safe_print,
-		interrupt = get_interrupt(pos),
-		digiline_send = get_digiline_send(pos),
 		string = {
 			byte = string.byte,
 			char = string.char,
@@ -361,20 +472,58 @@ local function create_environment(pos, mem, event)
 			time = os.time,
 			datetable = safe_date,
 		},
+		coroutine = make_safe_coroutine(),
 	}
 	env._G = env
+
+	env.loadstring = get_loadstring(env)
+
 
 	for _, name in pairs(safe_globals) do
 		env[name] = _G[name]
 	end
 
+	for k,v in pairs(mesecon.luacontroller_extfuncs) do
+		if type(v) == "function" then
+			env[k] = v
+		elseif type(v) == "string" then
+			local f = env.loadstring(v)
+
+			local ok, ret = pcall(f)
+
+			if ok then
+				env[k] = ret
+				--print('extfuncs ' .. k .. ': ' .. tostring(env[k]))
+			else
+			end
+		end
+	end
+
 	return env
 end
 
+local function update_env(env, pos, event)
+	-- Gather variables for the environment
+	local vports = minetest.registered_nodes[minetest.get_node(pos).name].virtual_portstates
+	local vports_copy = {}
+	for k, v in pairs(vports) do vports_copy[k] = v end
+	local rports = get_real_port_states(pos)
+
+	env.pin = merge_port_states(vports, rports)
+	env.port = vports_copy
+	env.event = event
+
+	env.heat = minetest.get_meta(pos):get_int("heat")
+	env.heat_max = mesecon.setting("overheat_max", 20)
+
+	-- in case the luacontroller was moved
+	env.interrupt = get_interrupt(pos)
+	env.digiline_send = get_digiline_send(pos)
+end
 
 local function timeout()
 	debug.sethook() -- Clear hook
-	error("Code timed out!", 2)
+	error(timeout_sentinel, 2)
 end
 
 
@@ -423,24 +572,59 @@ local function save_memory(pos, meta, mem)
 	end
 end
 
+local function getcontroller(pos, meta, event)
+	local luac_id = meta:get_int("luac_id")
+	--print("lc "..luac_id..":")
+
+	local lc = lc_cache[luac_id]
+
+	local f, msg, env
+
+	local env
+
+	local mem
+
+	if lc then
+		--print("cached")
+		f, env = lc.f, lc.env
+	else
+		--print("loading")
+		-- Load code & mem from meta
+		mem  = load_memory(meta)
+		local code = meta:get_string("code")
+
+		-- Create environment
+		env = create_environment(luac_id, pos, mem)
+
+		f, msg = create_sandbox(code, env)
+
+		if not f then
+			return nil, msg, env
+		end
+
+		lc_cache[luac_id] = {f=f, env=env}
+	end
+
+	update_env(env, pos, event)
+
+	return f, msg, env
+end
 
 local function run(pos, event)
 	local meta = minetest.get_meta(pos)
 	if overheat(pos) then return end
 	if ignore_event(event, meta) then return end
 
-	-- Load code & mem from meta
-	local mem  = load_memory(meta)
-	local code = meta:get_string("code")
-
-	-- Create environment
-	local env = create_environment(pos, mem, event)
-
-	-- Create the sandbox and execute code
-	local f, msg = create_sandbox(code, env)
+	local f, msg, env = getcontroller(pos, meta, event)
 	if not f then return msg end
 	local success, msg = pcall(f)
-	if not success then return msg end
+	if not success then
+		if msg == timeout_sentinel then
+			msg = "Code timed out!"
+			burn_controller(pos)
+		end
+		return msg
+	end
 	if type(env.port) ~= "table" then
 		return "Ports set are invalid."
 	end
@@ -453,11 +637,16 @@ local function run(pos, event)
 end
 
 mesecon.queue:add_function("lc_interrupt", function (pos, luac_id, iid)
-	-- There is no luacontroller anymore / it has been reprogrammed / replaced / burnt
-	if (minetest.get_meta(pos):get_int("luac_id") ~= luac_id) then return end
+	local meta = minetest.get_meta(pos)
+	-- There is no luacontroller anymore / it has been reprogrammed / replaced
+	if (meta:get_int("luac_id") ~= luac_id) then
+		lc_cache[luac_id] = nil
+		return
+	end
 	if (minetest.registered_nodes[minetest.get_node(pos).name].is_burnt) then return end
 	run(pos, {type="interrupt", iid = iid})
 end)
+
 
 local function reset_meta(pos, code, errmsg)
 	local meta = minetest.get_meta(pos)
@@ -471,6 +660,11 @@ local function reset_meta(pos, code, errmsg)
 		"image_button_exit[9.72,-0.25;0.425,0.4;jeija_close_window.png;exit;]"..
 		"label[0.1,5;"..errmsg.."]")
 	meta:set_int("heat", 0)
+
+	if meta:get_int("luac_id") then
+		lc_cache[meta:get_int("luac_id")] = nil
+	end
+
 	meta:set_int("luac_id", math.random(1, 65535))
 end
 
@@ -504,7 +698,7 @@ local digiline = {
 	receptor = {},
 	effector = {
 		action = function(pos, node, channel, msg)
-			run(pos, {type = "digiline", channel = channel, msg = msg})
+			run(pos, {type = "digiline", channel = channel, msg = mesecon.tablecopy(msg)})
 		end
 	}
 }
@@ -605,8 +799,11 @@ for d = 0, 1 do
 			c = c == 1,
 			d = d == 1,
 		},
-		after_dig_node = function (pos, node)
+		after_dig_node = function (pos, node, meta)
 			mesecon.receptor_off(pos, output_rules)
+			if meta.fields.luac_id then
+				lc_cache[meta.fields.luac_id] = nil
+			end
 		end,
 		is_luacontroller = true,
 	})
